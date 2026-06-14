@@ -1,0 +1,328 @@
+import torch
+import torch.nn as nn
+import logging
+from hmat.modeling.backbone.dinov3_wrapper import DINOv3Wrapper
+from hmat.modeling.encoder.hierarchical_encoder import HierarchicalVisualEncoder
+from hmat.modeling.decoder.memory_decoder import MemoryAugmentedDecoder
+from hmat.modeling.memory.memory_bank import MemoryBank
+from hmat.modeling.memory.batch_memory_bank import BatchMemoryBank
+from hmat.modeling.heads.multitask_heads import MultitaskHeads
+
+
+class HMAT(nn.Module):
+    """
+    Hierarchical Memory-Augmented Tracker (HMAT)
+
+    End-to-end Transformer architecture for underwater small object tracking.
+
+    Components:
+    1. Hierarchical Visual Encoder: Efficient multi-level feature extraction
+    2. Memory-Augmented Decoder: Context-aware decoding with gated memory attention
+    3. Multi-task Heads: Joint detection, tracking, and segmentation
+    4. Recurrent Memory Bank: GRU-based feature evolution
+    """
+
+    def __init__(self, num_classes=1, hidden_dim=256, num_queries=300,
+                 num_detect_queries=100, max_track_age=30, with_mask=False,
+                 backbone_weights=None, use_batch_memory=False,
+                 max_memory_size=5, max_batch_size=32):
+        super().__init__()
+
+        self.num_classes = num_classes
+        self.hidden_dim = hidden_dim
+        self.num_queries = num_queries
+        self.num_detect_queries = num_detect_queries
+        self.num_track_queries = num_queries - num_detect_queries
+        self.use_batch_memory = use_batch_memory
+        self.max_memory_size = max_memory_size
+        self.max_batch_size = max_batch_size
+
+
+        # 1. Backbone: DINOv3 (Vision Transformer)
+        self.backbone = DINOv3Wrapper(
+            output_dim=hidden_dim,
+            weights_path=backbone_weights,
+            use_checkpoint=True
+        )
+
+        # 2. Hierarchical Encoder
+        self.encoder = HierarchicalVisualEncoder(
+            hidden_dim=hidden_dim,
+            num_levels=2,
+            num_rois=10
+        )
+
+        # 3. Memory-Augmented Decoder
+        self.decoder = MemoryAugmentedDecoder(
+            d_model=hidden_dim,
+            nhead=8,
+            num_layers=6,
+            dim_feedforward=1024,
+            dropout=0.2
+        )
+
+        # 4. Multi-task Prediction Heads
+        self.heads = MultitaskHeads(
+            d_model=hidden_dim,
+            num_classes=num_classes,
+            num_queries=num_queries,
+            with_mask=with_mask,
+            with_track_id=True
+        )
+
+        # 5. Memory Bank for tracking
+        # Dual-mode: BatchMemoryBank for training, MemoryBank for inference
+        if use_batch_memory:
+            self.memory_bank = BatchMemoryBank(
+                hidden_dim=hidden_dim,
+                max_memory_size=max_memory_size,
+                max_batch_size=max_batch_size
+            )
+        else:
+            self.memory_bank = MemoryBank(
+                hidden_dim=hidden_dim,
+                max_age=max_track_age
+            )
+
+        # 6. Learnable Detection Queries
+        # Content embeddings (what to detect)
+        self.detect_queries_embed = nn.Embedding(
+            self.num_detect_queries, hidden_dim
+        )
+        # Position embeddings (where to detect) - 为queries添加空间分工能力
+        self.detect_queries_pos = nn.Embedding(
+            self.num_detect_queries, hidden_dim
+        )
+
+    def forward(self, images, targets=None):
+        """
+        Forward pass through HAMT.
+
+        Args:
+            images: [B, C, H, W] input images (supports B>1 with BatchMemoryBank)
+            targets: Optional list of target annotations for training
+
+        Returns:
+            outputs: List of prediction dicts for each frame/query
+        """
+        B, C, H, W = images.shape
+
+        # Get feature map size
+        # DINOv3 typically has patches of size 14x14
+        num_patches = (H // 14) * (W // 14)
+
+        # 1. Extract hierarchical features from backbone through encoder
+        src_feats, src_mask, src_pos = self.encoder(self.backbone, images)
+        # src_feats: [B, N_global+N_local, D]
+
+        # 2. Prepare track queries from memory (move to same device as input)
+        track_embeds, track_ids, track_boxes = self.memory_bank.get_track_queries()
+        dev = images.device
+        if len(track_ids) > 0:
+            track_embeds = track_embeds.to(dev).unsqueeze(0).expand(B, -1, -1)
+            # 为track queries生成位置编码（基于上一帧的bbox）
+            track_pos = self._generate_pos_from_boxes(track_boxes.detach(), dev).unsqueeze(0).expand(B, -1, -1)
+        else:
+            track_embeds = torch.empty((B, 0, self.hidden_dim), device=dev)
+            track_pos = torch.empty((B, 0, self.hidden_dim), device=dev)
+
+        # 3. Get detect queries (learnable)
+        detect_queries = self.detect_queries_embed.weight.unsqueeze(
+            0).expand(B, -1, -1)
+        # detect_queries: [B, N_detect, D]
+        detect_pos = self.detect_queries_pos.weight.unsqueeze(
+            0).expand(B, -1, -1)
+        # detect_pos: [B, N_detect, D]
+
+        # 4. Combine track and detect queries
+        if track_embeds.shape[1] > 0:
+            all_queries = torch.cat([track_embeds, detect_queries], dim=1)
+            # all_queries: [B, N_track + N_detect, D]
+        else:
+            all_queries = detect_queries
+
+        # 5. Get memory values for cross-attention with history
+        if self.use_batch_memory:
+            # 批量模式：每个样本有独立的记忆
+            if self.memory_bank.memory_count[:B].sum() > 0:
+                memory_values = self.memory_bank.memory.data[:B].to(dev)  # [B, K, D]
+            else:
+                memory_values = None
+        else:
+            memory_values = self.memory_bank.get_memory_values()
+            if memory_values is not None:
+                memory_values = memory_values.to(dev).expand(B, -1, -1)
+
+        # 6. Decode with memory augmentation
+        output_embeds = self.decoder(
+            src_feats, src_mask, src_pos,
+            detect_queries=detect_queries,
+            track_queries=track_embeds if track_embeds.shape[1] > 0 else None,
+            detect_pos=detect_pos,
+            track_pos=track_pos if track_embeds.shape[1] > 0 else None,
+            memory_values=memory_values
+        )
+        # output_embeds: [B, N_track + N_detect, D]
+
+        # 7. Generate predictions
+        outputs = self.heads(output_embeds)
+        # outputs: dict with 'pred_logits', 'pred_boxes', 'pred_masks' (optional), etc.
+
+        # 8. Update memory bank
+        # Memory update logic:
+        # - BatchMemoryBank mode: Always update (training needs memory for gates)
+        # - MemoryBank mode: Only update during inference (original behavior)
+        if self.use_batch_memory or not self.training:
+            if self.training and targets is not None:
+                self._update_memory(output_embeds, outputs, track_ids, targets)
+            else:
+                self._update_memory(output_embeds, outputs, track_ids)
+
+        return [outputs]  # Return list for compatibility with training loop
+
+
+    def _generate_pos_from_boxes(self, boxes, device):
+        """
+        Generate position embeddings from bounding boxes.
+        
+        Args:
+            boxes: [N, 4] tensor of boxes (cx, cy, w, h) normalized to [0, 1]
+            device: target device
+        
+        Returns:
+            pos_embeds: [N, D] position embeddings
+        """
+        if boxes.numel() == 0:
+            return torch.empty((0, self.hidden_dim), device=device)
+        
+        # 将boxes移到目标设备
+        boxes = boxes.to(device)
+        N = boxes.shape[0]
+        
+        # 使用正弦位置编码将4维bbox编码为hidden_dim维
+        d_model = self.hidden_dim
+        pos_enc = torch.zeros(N, d_model, device=device)
+        
+        # 为每个bbox维度(cx, cy, w, h)生成位置编码
+        for i in range(4):
+            # 对第i维bbox坐标进行编码
+            div_term = torch.exp(torch.arange(0, d_model//4, 2, device=device).float() * 
+                                 (-torch.log(torch.tensor(10000.0)) / (d_model//4)))
+            
+            pos_i = boxes[:, i].unsqueeze(1) * div_term
+            pos_enc[:, i*(d_model//4):i*(d_model//4)+d_model//8] = torch.sin(pos_i)
+            pos_enc[:, i*(d_model//4)+d_model//8:(i+1)*(d_model//4)] = torch.cos(pos_i)
+        
+        return pos_enc
+
+    def _update_memory(self, output_embeds, outputs, track_ids, targets=None):
+        """
+        Update memory bank with new observations.
+
+        Args:
+            output_embeds: [B, N_track+N_detect, D] decoder outputs
+            outputs: dict with predictions
+            track_ids: list of current track IDs
+            targets: Optional ground truth for supervised update
+        """
+        num_tracks = len(track_ids)
+
+        if num_tracks > 0:
+            track_embeds = output_embeds[:, :num_tracks, :]
+            track_preds = {
+                k: v[:, :num_tracks, ...] if v.shape[1] > 0 else v
+                for k, v in outputs.items()
+            }
+        else:
+            track_embeds = output_embeds[:, :, :].clone() * 0  # Empty tensor
+            track_preds = {}
+
+        detect_embeds = output_embeds[:, num_tracks:, :]
+        detect_preds = {
+            k: v[:, num_tracks:, ...] if v.shape[1] > 0 else v
+            for k, v in outputs.items()
+        }
+
+        # Update memory bank
+        self.memory_bank.update(
+            track_embeds,
+            track_preds,
+            detect_embeds,
+            detect_preds,
+            targets=targets
+        )
+
+    def set_train_mode(self, freeze_backbone=True):
+        """[遗留接口] 简单冻结/解冻backbone, 三步走训练不使用此方法."""
+        self.train()
+        if freeze_backbone:
+            self.backbone.freeze_backbone()
+            logging.info("Backbone frozen for training")
+        else:
+            self.backbone.unfreeze_backbone()
+            logging.info("Backbone unfrozen for training")
+
+    def configure_for_stage(self, stage):
+        """
+        [遗留接口] 模型内置冻结策略 — 三步走训练不使用此方法。
+
+        当前三步走训练使用 scripts/train_3step.py 中的 configure_stage_freezing()，
+        该函数直接操作模型参数的 requires_grad，提供更精细的控制。
+
+        此方法保留为备用，其冻结策略（S1冻结/S2解冻后4层/S3全解冻）
+        与三步走策略（S1全解冻/S2选择性解冻/S3全解冻）不同。
+        """
+        self.train()
+        if stage == 1:
+            self.backbone.freeze_all_backbone()
+            logging.info("Stage 1: Backbone完全冻结, 训练新增组件")
+        elif stage == 2:
+            self.backbone.unfreeze_top_blocks(n=4)
+            logging.info("Stage 2: 解冻backbone后4层(blocks.20-23) + norm")
+        elif stage == 3:
+            self.backbone.unfreeze_all_except_patch_embed()
+            logging.info("Stage 3: 解冻全部backbone(除patch_embed)")
+        else:
+            raise ValueError(f"Unknown stage: {stage}")
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        logging.info(f"可训练参数: {trainable/1e6:.2f}M / {total/1e6:.2f}M ({100*trainable/total:.1f}%)")
+
+    def get_parameter_groups(self, base_lr=1e-4, backbone_lr_scale=1.0):
+        """
+        获取分层学习率的参数组。
+
+        Args:
+            base_lr: 新增模块的基础学习率
+            backbone_lr_scale: backbone学习率缩放因子 (Stage 3 用 0.1)
+        """
+        backbone_vit_params = []
+        other_params = []
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'backbone.vit.' in name:
+                backbone_vit_params.append(param)
+            else:
+                other_params.append(param)
+
+        param_groups = []
+        if other_params:
+            param_groups.append({
+                "params": other_params,
+                "lr": base_lr,
+                "name": "new_modules",
+            })
+        if backbone_vit_params:
+            param_groups.append({
+                "params": backbone_vit_params,
+                "lr": base_lr * backbone_lr_scale,
+                "name": "backbone_vit",
+            })
+        return param_groups
+
+
+class HMATModel(HMAT):
+    pass

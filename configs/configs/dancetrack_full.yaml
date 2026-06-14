@@ -1,0 +1,99 @@
+# HAMT DanceTrack 全量训练配置 v3
+# 关键修复：减少stage1 epoch防过拟合、缩短warmup、确保cosine T_max合理
+
+experiment:
+  name: dancetrack_full
+  seed: 42
+
+# ========== 模型 ==========
+model:
+  num_classes: 1
+  hidden_dim: 256
+  num_queries: 300
+  num_detect_queries: 100
+  max_track_age: 30
+  use_batch_memory: true
+  max_memory_size: 6
+  max_track_idle: 12
+
+# ========== DINOv3 Backbone ==========
+backbone:
+  weights: null
+
+# ========== 训练 ==========
+training:
+  epochs: 53                   # 3(阶段1) + 40(阶段2) + 10(阶段3)
+  batch_size: 2
+  gradient_accumulation: 2     # 等效 batch=4
+  num_workers: 2
+  img_size: [640, 640]
+  use_amp: true
+  grad_clip_norm: 0.5
+
+# ========== 损失权重 (CIoU替代GIoU，提升bbox回归精度) ==========
+loss:
+  cls_weight: 1.0
+  l1_weight: 3.0
+  ciou_weight: 2.0
+  reid_weight: 1.0
+  mask_weight: 0.0
+
+# ========== 分层学习率 ==========
+lr:
+  backbone_base: 1.0e-4        # DINOv3骨干（预训练过，保守）
+  head_base: 2.0e-4            # 头部基础lr
+  backbone_min: 1.0e-5         # 骨干最小lr
+  head_min: 2.0e-5             # 头部最小lr
+  warmup_steps: 1000           # per-step warmup（前N步线性爬升LR）
+  warmup_start_factor: 0.1     # warmup起始 = base_lr / 10
+  weight_decay: 1.0e-4
+
+# ========== 三阶段训练 ==========
+stages:
+  stage1:
+    epochs: [0, 2]              # 3个epoch快速收敛头部 (0-based)
+    freeze_backbone: true
+    sample_ratio: [4, 3, 3]
+    augment: basic
+
+  stage2:
+    epochs: [3, 42]             # 40个epoch主体训练
+    freeze_backbone: false
+    sample_ratio: [3, 3, 4]
+    augment: full
+    dance_aug_prob: 0.15
+
+  stage3:
+    epochs: [43, 52]            # 10个epoch精细微调
+    freeze_backbone: false
+    sample_ratio: [1, 1, 1]
+    augment: minimal
+    lr_fixed: true
+
+# ========== 数据集路径 ==========
+datasets:
+  dancetrack:
+    train: data/DanceTrack/train
+    val: data/DanceTrack/val
+  mot17:
+    train: /home/user/MOT17/MOT17/train
+    val: /home/user/MOT17/MOT17/test
+  mot20:
+    train: /home/user/MOT20/MOT20/train
+    val: /home/user/MOT20/MOT20/test
+
+# ========== 验证 ==========
+val:
+  split_ratio: [6, 4]
+  eval_interval: 5
+
+# ========== 检查点 ==========
+checkpoint:
+  save_interval: 5
+  eval_interval: 5
+  interval_steps: 200
+
+# ========== GRU记忆衰减 ==========
+memory:
+  decay_coeff: 0.95
+  idle_decay_start: 5

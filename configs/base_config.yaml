@@ -1,0 +1,51 @@
+# HMAT 基础配置
+# 三步走训练的具体超参见 scripts/train_3step.py 中的 STAGE_CONFIGS
+
+model:
+  name: hmat
+  backbone: dinov3_vitl16
+  backbone_weights: dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+  num_queries: 100        # 检测查询数
+  num_classes: 1          # 跟踪任务 (前景/背景)
+  d_model: 256            # Transformer 特征维度
+  nhead: 8                # 多头注意力头数
+  num_decoder_layers: 6   # 解码器层数
+  dropout: 0.2
+
+data:
+  # Stage 1: DanceTrack + MOT17
+  dancetrack_roots:
+    - /root/data/train/train1
+    - /root/data/train/train2
+  mot17_roots:
+    - /root/data/train/MOT17/train/MOT17-02-SDP
+    - /root/data/train/MOT17/train/MOT17-04-SDP
+    - /root/data/train/MOT17/train/MOT17-05-SDP
+    - /root/data/train/MOT17/train/MOT17-09-SDP
+    - /root/data/train/MOT17/train/MOT17-10-SDP
+    - /root/data/train/MOT17/train/MOT17-11-SDP
+    - /root/data/train/MOT17/train/MOT17-13-SDP
+  # Stage 2/3: Brackish
+  brackish_train: /root/data/Brackish/train
+  brackish_val: /root/data/Brackish/val
+  # 可选: UW-COT220
+  uwcot_train: /root/data/UW-COT220/train
+  uwcot_val: /root/data/UW-COT220/val
+
+  input_size: [800, 1333]
+  window_size: 8          # 训练时序窗口长度
+  num_workers: 4
+
+solver:
+  # 以下为 Stage 1 默认值, 各阶段覆盖见 train_3step.py
+  lr: 0.0001
+  backbone_lr_scale: 0.1
+  weight_decay: 0.0001
+  epochs: 50
+  warmup_steps: 500
+  ema_decay: 0.999
+
+training:
+  output_dir: results/3step
+  amp: true               # 自动混合精度
+  grad_clip: 1.0
