@@ -1,0 +1,173 @@
+# =============================================================================
+# HAMT 三阶段训练配置 (新方案)
+# =============================================================================
+# Phase 1: CrowdHuman 纯检测筑基 (15 epochs)
+# Phase 2: MOT17+MOT20 线性运动关联 (20 epochs)
+# Phase 3: DanceTrack 极难域微调 (20 epochs)
+# =============================================================================
+
+output_dir: results
+
+# =============================================================================
+# Phase 1: 纯粹的检测筑基 (CrowdHuman)
+# =============================================================================
+phases:
+  phase1:
+    enabled: true
+    phase_type: crowdhuman
+    epochs: 35
+    img_size: [640, 640]
+    batch_size: 24
+    gradient_accumulation: 32
+    num_workers: 0
+    use_amp: true
+    grad_clip_norm: 1.0
+    num_queries: 100
+    hidden_dim: 256
+    num_classes: 1
+    save_interval: 5
+
+    # 分层学习率 (Phase 1 只用 head_lr，因为 backbone 前5epoch冻结)
+    lr:
+      backbone_lr: 2.0e-4
+      head_lr: 2.0e-4
+      min_lr: 1.0e-6
+      warmup_steps: 500
+      warmup_start_factor: 0.1
+      weight_decay: 1.0e-4
+
+    # 主干网络冻结策略: 前5 epoch 全冻结，后10 epoch 解冻最后2层
+    freeze:
+      freeze_epochs: 5
+      unfreeze_last_n: 2
+
+    # Loss 配置 (Phase 1: 仅检测，无 ReID)
+    loss:
+      cls_weight: 0.5
+      l1_weight: 5.0
+      ciou_weight: 2.0
+      reid_weight: 0.0
+      losses: [labels, boxes]
+
+    # 记忆库 (Phase 1 关闭)
+    memory:
+      enabled: false
+      teacher_forcing: false
+
+    # Scheduled Sampling (Phase 1 不适用)
+    scheduled_sampling:
+      enabled: false
+
+    # EMA (Phase 1 不启用)
+    ema:
+      enabled: false
+
+  # =============================================================================
+  # Phase 2: 线性运动规律关联 (MOT17 + MOT20)
+  # =============================================================================
+  phase2:
+    enabled: true
+    phase_type: mot
+    epochs: 20
+    img_size: [640, 640]
+    batch_size: 32
+    gradient_accumulation: 4       # effective_batch = 128 (降噪求稳)
+    num_workers: 2                 # 降低共享内存占用，避免 Bus error
+    use_amp: true
+    grad_clip_norm: 1.0
+    num_queries: 100
+    hidden_dim: 256
+    num_classes: 1
+    save_interval: 5
+
+    # 分层学习率 (全面解冻，LR 按 sqrt 法则缩放: 2x)
+    lr:
+      backbone_lr: 2.0e-5
+      head_lr: 2.0e-4
+      min_lr: 1.0e-6
+      warmup_steps: 200
+      warmup_start_factor: 0.1
+      weight_decay: 1.0e-4
+
+    # 全面解冻 (unfreeze_all_backbone)
+    freeze:
+      freeze_epochs: 0
+      unfreeze_last_n: 12
+
+    # Loss 配置 (加入 ReID)
+    loss:
+      cls_weight: 0.5
+      l1_weight: 5.0
+      ciou_weight: 2.0
+      reid_weight: 1.0
+      reid_warmup_epochs: 5         # ReID 渐进预热：epoch 1-5 从 0.1 线性升至 1.0
+      losses: [labels, boxes, reid]
+
+    # 记忆库 (开启 + Teacher Forcing)
+    memory:
+      enabled: true
+      teacher_forcing: true
+
+    # Scheduled Sampling (Phase 2 不启用，全部 Teacher Forcing)
+    scheduled_sampling:
+      enabled: false
+
+    # EMA (Phase 2 不启用)
+    ema:
+      enabled: false
+
+  # =============================================================================
+  # Phase 3: DanceTrack 极难域微调
+  # =============================================================================
+  phase3:
+    enabled: true
+    phase_type: dancetrack
+    epochs: 20
+    img_size: [640, 640]
+    batch_size: 32
+    gradient_accumulation: 2    # effective_batch = 64 (不变，16→32, 4→2)
+    num_workers: 2
+    use_amp: true
+    grad_clip_norm: 1.0
+    num_queries: 100
+    hidden_dim: 256
+    num_classes: 1
+    save_interval: 5
+
+    # 极低学习率微调
+    lr:
+      backbone_lr: 5.0e-6
+      head_lr: 1.0e-5
+      min_lr: 1.0e-7
+      warmup_steps: 0
+      warmup_start_factor: 1.0
+      weight_decay: 5.0e-5
+
+    # 全参数训练
+    freeze:
+      freeze_epochs: 0
+      unfreeze_last_n: 12
+
+    # Loss 配置 (全部开启)
+    loss:
+      cls_weight: 0.5
+      l1_weight: 5.0
+      ciou_weight: 2.0
+      reid_weight: 1.0
+      losses: [labels, boxes, reid]
+
+    # 记忆库 (开启)
+    memory:
+      enabled: true
+      teacher_forcing: false
+
+    # Scheduled Sampling (1.0 → 0.3)
+    scheduled_sampling:
+      enabled: true
+      start_prob: 1.0
+      end_prob: 0.3
+
+    # EMA (开启，收集平滑权重)
+    ema:
+      enabled: true
+      decay: 0.999
